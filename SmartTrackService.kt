@@ -58,6 +58,7 @@ class SmartTrackService : Service() {
     @Volatile
     private var isSyncRunning = false
     private var empId: String = ""
+    private var activeTrackingDate: String = ""
 
     private val STATUS_CHECK_INTERVAL = 5 * 60 * 1000L
     companion object {
@@ -69,6 +70,11 @@ class SmartTrackService : Service() {
         const val EXTRA_VKID = "extra_vkid"
     }
 
+    private fun isNewDayOrMidnight(): Boolean {
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        return activeTrackingDate.isNotEmpty() && activeTrackingDate != today
+    }
+
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service created")
@@ -78,6 +84,7 @@ class SmartTrackService : Service() {
         createNotificationChannel()
         val pref = PrefManager(this)
         empId = pref.getEmployeeId() ?: ""
+        activeTrackingDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
     }
 
     private fun getActivityRecognitionPendingIntent(): PendingIntent {
@@ -136,6 +143,7 @@ class SmartTrackService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "Service start requested")
+        activeTrackingDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
 
         if (intent == null) {
             startForegroundInternal()
@@ -192,24 +200,26 @@ class SmartTrackService : Service() {
     private fun startLocationTracking() {
         trackingJob?.cancel()
         trackingJob = serviceScope.launch {
-//            while (isActive) {
-//                if (!PunchStateHolder.isPunchedIn) {
-//                    Log.w(TAG, "🚫 Punch status became false — stopping service")
-//                    stopActivityRecognitionUpdates()
-//                    stopSelf()
-//                    break
-//                }
-//                try {
-//                    Log.d(TAG, "Employee punched IN - capturing location")
-//                    insertAndSyncLocation()
-//                } catch (e: Exception) {
-//                    Log.e(TAG, "Tracking loop error", e)
-//                }
-//                delay(8000L)
-//            }
-
             while (isActive) {
 
+                // Check 1: Midnight 12:00 AM (New day started) -> Auto Punch Out & clean stop
+                if (isNewDayOrMidnight()) {
+                    Log.d(TAG, "🌙 Midnight 12:00 AM reached (new day started) — Auto Punch Out triggered")
+                    PunchStateHolder.isPunchedIn = false
+                    SmartTrackEvents.autoPunchOut.tryEmit("OUT")
+
+                    if (NetworkUtil.isNetworkAvailable(this@SmartTrackService)) {
+                        syncPendingLocations()
+                    }
+
+                    statusCheckJob?.cancel()
+                    stopActivityRecognitionUpdates()
+                    SignalStrengthMonitor.stop()
+                    stopSelf()
+                    break
+                }
+
+                // Check 2: Punched Out -> Terminate and do not store any data
                 if (!PunchStateHolder.isPunchedIn) {
 
                     Log.d(TAG, "Punch Out detected")
@@ -310,6 +320,22 @@ class SmartTrackService : Service() {
         statusCheckJob = serviceScope.launch {
             while (isActive) {
                 delay(STATUS_CHECK_INTERVAL)
+
+                if (isNewDayOrMidnight()) {
+                    Log.w(TAG, "🌙 Midnight reached during status polling — Auto Punch Out triggered")
+                    PunchStateHolder.isPunchedIn = false
+                    SmartTrackEvents.autoPunchOut.tryEmit("OUT")
+
+                    if (NetworkUtil.isNetworkAvailable(this@SmartTrackService)) {
+                        syncPendingLocations()
+                    }
+
+                    stopActivityRecognitionUpdates()
+                    SignalStrengthMonitor.stop()
+                    stopSelf()
+                    break
+                }
+
                 val stillIn = verifyPunchStatusFromServer()
                 if (!stillIn) {
 
@@ -405,8 +431,15 @@ class SmartTrackService : Service() {
             else -> rawActivity.ifBlank { DEFAULT_ACTIVITY_TYPE }
         }
     }
+
     private suspend fun insertAndSyncLocation() {
         try {
+            // Strict guard 1: Never capture or store ANY data in DB if punched out or midnight reached
+            if (!PunchStateHolder.isPunchedIn || isNewDayOrMidnight()) {
+                Log.d(TAG, "⏸️ Punched out or midnight reached — skipping location capture & DB save")
+                return
+            }
+
             if (ActivityCompat.checkSelfPermission(this@SmartTrackService, Manifest.permission.ACCESS_FINE_LOCATION)
                 != PackageManager.PERMISSION_GRANTED
             ) {
@@ -539,6 +572,12 @@ class SmartTrackService : Service() {
                 networkType = getNetworkType(),
                 signalStrength = SignalStrengthMonitor.lastSignalLevel
             )
+
+            // Strict guard 2: Final pre-insert verification
+            if (!PunchStateHolder.isPunchedIn || isNewDayOrMidnight()) {
+                Log.d(TAG, "⏸️ Aborting DB insert — user is Punched OUT or midnight reached")
+                return
+            }
 
             db.smartTrackDao().insertTrackData(entity)
             Log.d(
