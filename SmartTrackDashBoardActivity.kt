@@ -145,6 +145,7 @@ class SmartTrackDashBoardActivity : AppCompatActivity(), OnMapReadyCallback {
     private var start: String = ""
     private var end: String = ""
     private var empId: String = ""
+    private var lastLoadedDate: String = ""
     private lateinit var stSummaryViewModel: SmartTrackSummaryViewModel
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -152,6 +153,7 @@ class SmartTrackDashBoardActivity : AppCompatActivity(), OnMapReadyCallback {
         binding = ActivitySmartTrackDashboardBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        lastLoadedDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
         initDependencies()
         initUI()
         resetFilterValues()
@@ -819,8 +821,9 @@ class SmartTrackDashBoardActivity : AppCompatActivity(), OnMapReadyCallback {
     private fun observeAutoPunchOut() {
         lifecycleScope.launch {
             SmartTrackEvents.autoPunchOut.collect {
+                isPunchedIn = false
+                stopSmartTrackService()
                 refreshTrackingData()
-//                showDialog("Auto Punch-Out", "You were automatically punched out at day end.")
             }
         }
     }
@@ -1200,8 +1203,18 @@ class SmartTrackDashBoardActivity : AppCompatActivity(), OnMapReadyCallback {
             arePermissionsGranted = true
             onAllPermissionsGranted()
         }
-        if (isUserDataReady) {
-            refreshTrackingData()      // ⬅️ ADD
+
+        val today = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+        val isNewDay = lastLoadedDate.isNotEmpty() && lastLoadedDate != today
+        if (isNewDay) {
+            lastLoadedDate = today
+            resetFilterValues()
+            selectedDuration = "MTD"
+            start = ""
+            end = ""
+            refreshTrackingData()
+        } else if (isUserDataReady) {
+            refreshTrackingData()
         }
     }
 
